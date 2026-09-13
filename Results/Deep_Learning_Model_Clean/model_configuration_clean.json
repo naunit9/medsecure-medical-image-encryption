@@ -1,0 +1,62 @@
+{
+    "seed": 42,
+    "feature_columns": [
+        "mean",
+        "std",
+        "variance",
+        "median",
+        "min_intensity",
+        "max_intensity",
+        "skewness",
+        "kurtosis",
+        "entropy",
+        "histogram_energy",
+        "edge_density",
+        "glcm_contrast",
+        "glcm_dissimilarity",
+        "glcm_homogeneity",
+        "glcm_energy",
+        "glcm_correlation",
+        "glcm_asm"
+    ],
+    "target_columns": [
+        "permutation_x0",
+        "permutation_r",
+        "forward_x0",
+        "forward_mu",
+        "backward_x0",
+        "backward_r"
+    ],
+    "parameter_ranges": {
+        "permutation_x0": [
+            0.1,
+            0.9
+        ],
+        "permutation_r": [
+            3.9,
+            3.9999
+        ],
+        "forward_x0": [
+            0.1,
+            0.9
+        ],
+        "forward_mu": [
+            1.9,
+            1.9999
+        ],
+        "backward_x0": [
+            0.1,
+            0.9
+        ],
+        "backward_r": [
+            3.9,
+            3.9999
+        ]
+    },
+    "training_samples": 420,
+    "validation_samples": 90,
+    "test_samples": 90,
+    "target_version": "clean_v1",
+    "burn_in": 500,
+    "permutation_sort": "stable"
+}
