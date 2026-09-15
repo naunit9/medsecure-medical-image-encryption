@@ -87,7 +87,15 @@ PRODUCT_SUBTITLE = (
     "Adaptive Medical Image Encryption Platform"
 )
 
-CIPHER_VERSION = "MS-CHAOS-1.0"
+CIPHER_VERSION = "MS-CHAOS-2.0"
+LEGACY_CIPHER_VERSIONS = {"MS-CHAOS-1.0", "MS-CHAOS-2.0"}
+FAST_FEEDBACK_EVALUATIONS = 9
+FAST_FEEDBACK_ROUNDS = 2
+FAST_FEEDBACK_CANDIDATES_PER_ROUND = 4
+FAST_FEEDBACK_INITIAL_SCALE = 0.06
+FAST_FEEDBACK_RANDOM_SEED = 42
+IDEAL_NPCR = 99.609375
+IDEAL_UACI = 33.4635
 
 IMAGE_SIZE = (
     256,
@@ -2258,6 +2266,167 @@ def modify_center_pixel(
     return modified
 
 
+
+# ============================================================
+# FAST-9 DL-GUIDED FEEDBACK REFINEMENT
+# ============================================================
+
+def calculate_security_score(
+    entropy,
+    horizontal_corr,
+    vertical_corr,
+    diagonal_corr,
+    npcr,
+    uaci
+):
+    entropy_score = np.clip(entropy / 8.0, 0.0, 1.0)
+
+    mean_abs_corr = np.mean([
+        abs(horizontal_corr),
+        abs(vertical_corr),
+        abs(diagonal_corr)
+    ])
+
+    correlation_score = 1.0 - min(mean_abs_corr, 1.0)
+
+    npcr_score = np.clip(
+        1.0 - abs(npcr - IDEAL_NPCR) / IDEAL_NPCR,
+        0.0,
+        1.0
+    )
+
+    uaci_score = np.clip(
+        1.0 - abs(uaci - IDEAL_UACI) / IDEAL_UACI,
+        0.0,
+        1.0
+    )
+
+    return float(
+        0.25 * entropy_score
+        + 0.20 * correlation_score
+        + 0.30 * npcr_score
+        + 0.25 * uaci_score
+    )
+
+
+def feedback_modified_image(image):
+    """Part 18D differential-image convention: center pixel +1 modulo 256."""
+    modified = image.copy()
+    row = image.shape[0] // 2
+    column = image.shape[1] // 2
+    modified[row, column] = (int(modified[row, column]) + 1) % 256
+    return modified
+
+
+def evaluate_feedback_parameters(image, modified_image, parameters):
+    cipher = encrypt_image(image, parameters)
+    modified_cipher = encrypt_image(modified_image, parameters)
+
+    entropy = calculate_entropy(cipher)
+    horizontal_corr, vertical_corr, diagonal_corr = image_correlations(cipher)
+    npcr = calculate_npcr(cipher, modified_cipher)
+    uaci = calculate_uaci(cipher, modified_cipher)
+
+    score = calculate_security_score(
+        entropy,
+        horizontal_corr,
+        vertical_corr,
+        diagonal_corr,
+        npcr,
+        uaci
+    )
+
+    return {
+        "parameters": parameters.copy(),
+        "encrypted_image": cipher,
+        "modified_cipher": modified_cipher,
+        "entropy": entropy,
+        "horizontal_corr": horizontal_corr,
+        "vertical_corr": vertical_corr,
+        "diagonal_corr": diagonal_corr,
+        "npcr": npcr,
+        "uaci": uaci,
+        "security_score": score
+    }
+
+
+def clip_feedback_parameter(name, value):
+    minimum, maximum = PARAMETER_RANGES[name]
+    return float(np.clip(value, float(minimum), float(maximum)))
+
+
+def generate_local_feedback_candidate(parent, rng, scale_fraction):
+    candidate = {}
+
+    for parameter in TARGET_COLUMNS:
+        minimum, maximum = PARAMETER_RANGES[parameter]
+        minimum = float(minimum)
+        maximum = float(maximum)
+        width = maximum - minimum
+        sigma = scale_fraction * width
+
+        candidate[parameter] = clip_feedback_parameter(
+            parameter,
+            parent[parameter] + rng.normal(0.0, sigma)
+        )
+
+    return candidate
+
+
+def fast9_feedback_search(image, initial_parameters, seed=FAST_FEEDBACK_RANDOM_SEED):
+    """
+    Exact deployment-oriented search structure from Part 18D:
+    initial DL candidate + 2 rounds x 4 candidates = 9 evaluations.
+    Each round searches around the current best candidate.
+    """
+    modified_image = feedback_modified_image(image)
+    rng = np.random.default_rng(seed)
+    start_time = time.perf_counter()
+
+    best = evaluate_feedback_parameters(
+        image,
+        modified_image,
+        initial_parameters
+    )
+    initial_score = best["security_score"]
+    evaluations = 1
+
+    for round_index in range(FAST_FEEDBACK_ROUNDS):
+        scale = FAST_FEEDBACK_INITIAL_SCALE * (0.5 ** round_index)
+        round_best = best
+
+        for _ in range(FAST_FEEDBACK_CANDIDATES_PER_ROUND):
+            candidate = generate_local_feedback_candidate(
+                best["parameters"],
+                rng,
+                scale
+            )
+
+            result = evaluate_feedback_parameters(
+                image,
+                modified_image,
+                candidate
+            )
+            evaluations += 1
+
+            if result["security_score"] > round_best["security_score"]:
+                round_best = result
+
+        if round_best["security_score"] > best["security_score"]:
+            best = round_best
+
+    elapsed = time.perf_counter() - start_time
+
+    return {
+        "parameters": best["parameters"],
+        "initial_security_score": float(initial_score),
+        "refined_security_score": float(best["security_score"]),
+        "score_improvement": float(best["security_score"] - initial_score),
+        "evaluations": int(evaluations),
+        "feedback_time_seconds": float(elapsed)
+    }
+
+
 # ============================================================
 # HASH
 # ============================================================
@@ -2308,7 +2477,9 @@ def image_to_png_bytes(
 def create_key_package(
     parameters,
     processed_image,
-    encrypted_image
+    encrypted_image,
+    adaptive_mode="DL Only",
+    refinement_metadata=None
 ):
 
     return {
@@ -2337,6 +2508,12 @@ def create_key_package(
                     0
                 ]
             ),
+
+        "adaptive_mode":
+            adaptive_mode,
+
+        "refinement_metadata":
+            refinement_metadata or {},
 
         "burn_in":
             BURN_IN,
@@ -2394,16 +2571,10 @@ def parameters_from_key_package(
     key_package
 ):
 
-    if (
-        key_package.get(
-            "cipher_version"
-        )
-        !=
-        CIPHER_VERSION
-    ):
-
+    if key_package.get("cipher_version") not in LEGACY_CIPHER_VERSIONS:
         raise ValueError(
-            "Unsupported cipher version."
+            "Unsupported cipher version. Supported versions: "
+            + ", ".join(sorted(LEGACY_CIPHER_VERSIONS))
         )
 
 
@@ -2456,7 +2627,9 @@ def create_security_report(
     source_metadata,
     parameters,
     metrics,
-    timings
+    timings,
+    adaptive_mode="DL Only",
+    refinement_metadata=None
 ):
 
     return {
@@ -2478,6 +2651,12 @@ def create_security_report(
 
         "processing_resolution":
             "256x256 grayscale",
+
+        "adaptive_mode":
+            adaptive_mode,
+
+        "refinement_metadata":
+            refinement_metadata or {},
 
         "parameters": {
 
@@ -2593,7 +2772,7 @@ if page == "🔒 Encrypt":
 
 
     st.caption(
-        "Upload a medical image, generate adaptive parameters, encrypt it and export the protected image with its matching key."
+        "Upload a medical image, generate DL-based parameters, optionally refine them with Fast-9 feedback, encrypt it and export the protected image with its matching key."
     )
 
 
@@ -2743,9 +2922,26 @@ if page == "🔒 Encrypt":
                 )
 
 
+                adaptive_mode = st.radio(
+                    "Adaptive Parameter Mode",
+                    [
+                        "DL Only",
+                        "Fast-9 Feedback"
+                    ],
+                    index=1,
+                    horizontal=True,
+                    help=(
+                        "DL Only uses the neural-network prediction directly. "
+                        "Fast-9 starts from the DL prediction and performs "
+                        "8 local feedback candidates across two rounds."
+                    )
+                )
+
                 e3.metric(
                     "Parameter Mode",
-                    "Adaptive"
+                    "Fast-9 Adaptive"
+                    if adaptive_mode == "Fast-9 Feedback"
+                    else "DL Adaptive"
                 )
 
 
@@ -2825,6 +3021,39 @@ if page == "🔒 Encrypt":
                     -
                     prediction_start
                 )
+
+
+                refinement_metadata = {
+                    "enabled": False,
+                    "method": "DL Only",
+                    "evaluations": 1,
+                    "feedback_time_seconds": 0.0
+                }
+
+
+                if adaptive_mode == "Fast-9 Feedback":
+
+                    st.write(
+                        "Refining parameters with Fast-9 security feedback..."
+                    )
+
+                    feedback_result = fast9_feedback_search(
+                        processed_image,
+                        parameters,
+                        seed=FAST_FEEDBACK_RANDOM_SEED
+                    )
+
+                    parameters = feedback_result["parameters"]
+
+                    refinement_metadata = {
+                        "enabled": True,
+                        "method": "Fast-9 Feedback",
+                        "evaluations": feedback_result["evaluations"],
+                        "initial_security_score": feedback_result["initial_security_score"],
+                        "refined_security_score": feedback_result["refined_security_score"],
+                        "score_improvement": feedback_result["score_improvement"],
+                        "feedback_time_seconds": feedback_result["feedback_time_seconds"]
+                    }
 
 
                 st.write(
@@ -2911,7 +3140,9 @@ if page == "🔒 Encrypt":
                 key_package = create_key_package(
                     parameters,
                     processed_image,
-                    encrypted_image
+                    encrypted_image,
+                    adaptive_mode=adaptive_mode,
+                    refinement_metadata=refinement_metadata
                 )
 
 
@@ -2951,7 +3182,15 @@ if page == "🔒 Encrypt":
                         prediction_time,
 
                     "encryption":
-                        encryption_time
+                        encryption_time,
+
+                    "feedback_refinement":
+                        float(
+                            refinement_metadata.get(
+                                "feedback_time_seconds",
+                                0.0
+                            )
+                        )
                 }
 
 
@@ -2965,7 +3204,11 @@ if page == "🔒 Encrypt":
 
                     metrics,
 
-                    timings
+                    timings,
+
+                    adaptive_mode=adaptive_mode,
+
+                    refinement_metadata=refinement_metadata
                 )
 
 
@@ -2996,7 +3239,13 @@ if page == "🔒 Encrypt":
                         metrics,
 
                     "timings":
-                        timings
+                        timings,
+
+                    "adaptive_mode":
+                        adaptive_mode,
+
+                    "refinement_metadata":
+                        refinement_metadata
                 }
 
 
@@ -3155,6 +3404,23 @@ if page == "🔒 Encrypt":
                 "Diagonal Corr.",
                 f"{result['metrics']['diagonal_correlation']:.6f}"
             )
+
+
+            if result.get("adaptive_mode") == "Fast-9 Feedback":
+
+                refinement = result.get(
+                    "refinement_metadata",
+                    {}
+                )
+
+                st.info(
+                    "Fast-9 feedback: "
+                    f"{refinement.get('evaluations', 9)} evaluations | "
+                    f"score {refinement.get('initial_security_score', 0.0):.6f} "
+                    f"→ {refinement.get('refined_security_score', 0.0):.6f} | "
+                    f"improvement {refinement.get('score_improvement', 0.0):+.6f} | "
+                    f"feedback time {refinement.get('feedback_time_seconds', 0.0):.3f} s"
+                )
 
 
             (
